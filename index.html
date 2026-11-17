@@ -16,7 +16,7 @@
   }
   #overlay.hidden { opacity:0; pointer-events:none; }
   .card {
-    width:min(540px, 88vw); border:1px solid var(--line); border-radius:16px;
+    width:min(560px, 90vw); border:1px solid var(--line); border-radius:16px;
     padding:34px 36px 30px; background:rgba(16,24,39,.6); text-align:center;
   }
   .kicker { font-size:11px; letter-spacing:4px; color:var(--accent); text-transform:uppercase; }
@@ -44,11 +44,11 @@
   <div class="card">
     <div class="kicker">WebXR · Full-Physics Sandbox</div>
     <h1>BLOCK ROOM</h1>
-    <p class="sub">Blocks, a table — and now <b>your own physics body</b>.
-      Grab the world with your hands and pull yourself up: crates, tower, climbing wall.</p>
+    <p class="sub">A grassy field, your own physics body — and <b>Bonelab-style hands</b>.
+      Grab the air and pull yourself around, push off anything, climb anything.</p>
     <div class="ctrls">
-      <div><b>In VR</b>GRIP button — grab / release<br>Grab any solid surface &amp; pull = climb<br>Left stick — walk · Click stick / A — jump<br>Right stick — snap turn</div>
-      <div><b>On desktop</b>Click — lock mouse / hold to grab or climb<br>W A S D — move · Space — jump<br>Mouse — look · Esc — release mouse</div>
+      <div><b>In VR</b>Hold <b>GRIP</b> &amp; pull the air — move<br>Grab a solid surface &amp; pull — climb / push off<br>Hold <b>BOTH grips</b>, push down — jump<br><b>TRIGGER</b> — pick up blocks · Right stick — turn</div>
+      <div><b>On desktop</b>Click — lock mouse · W A S D — move<br>Space — jump<br>Hold mouse — grab blocks / climb<br>Esc — release mouse</div>
     </div>
     <button id="btn">ENTER VR</button>
     <div id="status">Checking for WebXR…</div>
@@ -69,26 +69,27 @@ import * as THREE from 'three';
 import * as CANNON from 'cannon-es';
 
 /* ---------------- constants ---------------- */
-const ARENA_R = 8;
-const BALL_R = 0.25, PLAYER_MASS = 70;   // the player: gray ball "leg" + body above
+const BALL_R = 0.25, PLAYER_MASS = 70;   // the player: gray ball "leg" + camera above
 const JUMP_V = 5.2;                      // jump impulse → ~1.4 m apex
-const SUS_W = 16, SUS_D = 14;            // suspension spring: ω and 2ζω (spring-damper)
+const SUS_W = 16, SUS_D = 10;            // suspension spring: ω and 2ζω
+const SUS_A_MAX = 200, SUS_MIN = -0.3, SUS_MAX = 0.45;   // leg compression range
 const WALK_SPEED = 3.0, CLIMB_STEER = 1.5;
-const GRAB_BLOCK_R = 0.22;     // hand → block pick-up radius
-const GRAB_WORLD_R = 0.11;     // hand → static surface proximity
-const SPRING = 26;             // climbing lock stiffness
-const LOCK_VCAP = 12;          // max climb velocity
+const GRAB_BLOCK_R = 0.22;     // trigger → block pick-up radius
+const GRAB_WORLD_R = 0.11;     // grip → static surface proximity
+const SPRING = 26;             // world-climb lock stiffness
+const AIR_SPRING = 12;         // grip-the-air movement stiffness
+const LOCK_VCAP = 12;          // max lock velocity
 const FOLLOW = 25, VMAX = 10;  // held-block follow
 const SNAP_ANGLE = Math.PI / 4;
 const COLORS = [0xe2574c, 0x4da8da, 0x67c23a, 0xf0b429, 0x9b7ede, 0xe8833a];
 const WOOD = 0x8a6a4f, SLATE = 0x46586e, PILLAR = 0x3a4a5e;
 
-/* ---------------- three.js scene ---------------- */
+/* ---------------- three.js scene: sky, sun, grass field ---------------- */
 const scene = new THREE.Scene();
-scene.background = new THREE.Color(0x0b0e14);
-scene.fog = new THREE.Fog(0x0b0e14, 9, 24);
+scene.background = new THREE.Color(0xcfe8ff);
+scene.fog = new THREE.Fog(0xcfe8ff, 70, 380);
 
-const camera = new THREE.PerspectiveCamera(70, innerWidth / innerHeight, 0.05, 60);
+const camera = new THREE.PerspectiveCamera(70, innerWidth / innerHeight, 0.05, 800);
 const dolly = new THREE.Group();
 dolly.add(camera);
 scene.add(dolly);
@@ -101,37 +102,192 @@ renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 document.body.appendChild(renderer.domElement);
 
-scene.add(new THREE.HemisphereLight(0x9db8d8, 0x20242c, 0.85));
-const sun = new THREE.DirectionalLight(0xffffff, 1.6);
-sun.position.set(3, 6, 2);
+scene.add(new THREE.HemisphereLight(0xbfd9f2, 0x6a8f4a, 0.95));
+const sun = new THREE.DirectionalLight(0xfff1d0, 1.5);
+sun.position.set(26, 44, 14);
 sun.castShadow = true;
 sun.shadow.mapSize.set(1024, 1024);
-sun.shadow.camera.left = -6; sun.shadow.camera.right = 6;
-sun.shadow.camera.top = 6;   sun.shadow.camera.bottom = -6;
+sun.shadow.camera.left = -7; sun.shadow.camera.right = 7;
+sun.shadow.camera.top = 7;   sun.shadow.camera.bottom = -7;
 scene.add(sun);
+scene.add(sun.target);
 
-/* floor */
-const floor = new THREE.Mesh(
-  new THREE.PlaneGeometry(ARENA_R * 2, ARENA_R * 2),
-  new THREE.MeshStandardMaterial({ color: 0x272b33, roughness: 0.95 })
+/* sky dome — blue gradient that follows the player */
+const skyDome = new THREE.Mesh(
+  new THREE.SphereGeometry(600, 24, 12),
+  new THREE.ShaderMaterial({
+    side: THREE.BackSide, depthWrite: false,
+    uniforms: {
+      cTop: { value: new THREE.Color(0x2e77d0) },
+      cHorizon: { value: new THREE.Color(0xcfe8ff) }
+    },
+    vertexShader: `
+      varying vec3 vDir;
+      void main() {
+        vDir = normalize(position);
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+      }`,
+    fragmentShader: `
+      uniform vec3 cTop; uniform vec3 cHorizon;
+      varying vec3 vDir;
+      void main() {
+        float h = clamp(vDir.y, 0.0, 1.0);
+        gl_FragColor = vec4(mix(cHorizon, cTop, pow(h, 0.6)), 1.0);
+      }`
+  })
 );
-floor.rotation.x = -Math.PI / 2;
-floor.receiveShadow = true;
-scene.add(floor);
-const grid = new THREE.GridHelper(ARENA_R * 2, 32, 0x3a4356, 0x2e3542);
-grid.position.y = 0.002;
-scene.add(grid);
+scene.add(skyDome);
 
-/* boundary ring */
-const ringPts = [];
-for (let i = 0; i <= 64; i++) {
-  const a = (i / 64) * Math.PI * 2;
-  ringPts.push(new THREE.Vector3(Math.cos(a) * ARENA_R, 0.01, Math.sin(a) * ARENA_R));
+/* glowing sun (layered additive sprites) */
+function radialTexture(inner, mid) {
+  const c = document.createElement('canvas');
+  c.width = c.height = 128;
+  const ctx = c.getContext('2d');
+  const g = ctx.createRadialGradient(64, 64, 0, 64, 64, 64);
+  g.addColorStop(0, inner);
+  g.addColorStop(0.3, mid);
+  g.addColorStop(1, 'rgba(255,255,255,0)');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, 128, 128);
+  return new THREE.CanvasTexture(c);
 }
-scene.add(new THREE.Line(
-  new THREE.BufferGeometry().setFromPoints(ringPts),
-  new THREE.LineBasicMaterial({ color: 0x2d7ab3, transparent: true, opacity: 0.5 })
-));
+const SUN_DIR = new THREE.Vector3(0.5, 0.55, 0.35).normalize();
+const sunSprite = new THREE.Sprite(new THREE.SpriteMaterial({
+  map: radialTexture('rgba(255,255,240,1)', 'rgba(255,214,120,0.5)'),
+  blending: THREE.AdditiveBlending, transparent: true, depthWrite: false, fog: false
+}));
+sunSprite.scale.set(110, 110, 1);
+scene.add(sunSprite);
+const sunCore = new THREE.Sprite(new THREE.SpriteMaterial({
+  map: radialTexture('rgba(255,255,255,1)', 'rgba(255,244,214,0.8)'),
+  blending: THREE.AdditiveBlending, transparent: true, depthWrite: false, fog: false
+}));
+sunCore.scale.set(34, 34, 1);
+scene.add(sunCore);
+
+/* endless grassy ground */
+const ground = new THREE.Mesh(
+  new THREE.PlaneGeometry(1200, 1200),
+  new THREE.MeshStandardMaterial({ color: 0x5a8b37, roughness: 1 })
+);
+ground.rotation.x = -Math.PI / 2;
+ground.receiveShadow = true;
+scene.add(ground);
+
+/* interactive grass: 3×3 tiles of instanced blades that follow the player.
+   Blades bend away from the leg-ball and both hands (shader uniforms), sway in
+   the wind, and fade out past ~14 m — grass only exists near you. */
+const GRASS_TILE = 10, GRASS_ROWS = 2200;
+const grassUniforms = {
+  uTime: { value: 0 },
+  uPlayer: { value: new THREE.Vector3(0, -100, 0) },
+  uHand0: { value: new THREE.Vector3(0, -100, 0) },
+  uHand1: { value: new THREE.Vector3(0, -100, 0) }
+};
+const grassMat = new THREE.ShaderMaterial({
+  uniforms: grassUniforms,
+  side: THREE.DoubleSide,
+  vertexShader: `
+    uniform float uTime;
+    uniform vec3 uPlayer, uHand0, uHand1;
+    varying float vY;
+    varying vec3 vTint;
+    void main() {
+      vY = position.y / 0.34;
+      vec4 ipos = instanceMatrix * vec4(0.0, 0.0, 0.0, 1.0);
+      vec4 base = modelMatrix * ipos;
+      vTint = instanceColor;
+      float tip = vY * vY;
+
+      /* grass only exists near the player */
+      float distP = distance(base.xz, uPlayer.xz);
+      float fade = 1.0 - smoothstep(11.0, 14.0, distP);
+
+      /* wind sway at the tip */
+      vec2 off = vec2(
+        sin(uTime * 1.6 + ipos.x * 0.8 + ipos.z * 0.6) * 0.045 +
+        sin(uTime * 3.4 + ipos.x * 2.3 + ipos.z * 1.7) * 0.02, 0.0);
+
+      /* leg-ball pushes grass aside (only when the ball is near the ground) */
+      float gP = 1.0 - smoothstep(0.0, 0.6, abs(uPlayer.y));
+      vec2 dp = base.xz - uPlayer.xz;
+      float rp = length(dp);
+      float wp = (1.0 - smoothstep(0.0, 0.55, rp)) * tip * gP;
+      off += (rp > 0.001 ? dp / rp : vec2(0.0)) * wp * 0.25;
+      float press = wp;
+
+      float g0 = 1.0 - smoothstep(0.0, 0.6, abs(uHand0.y));
+      vec2 d1 = base.xz - uHand0.xz;
+      float r1 = length(d1);
+      float w1 = (1.0 - smoothstep(0.0, 0.4, r1)) * tip * g0;
+      off += (r1 > 0.001 ? d1 / r1 : vec2(0.0)) * w1 * 0.2;
+      press = max(press, w1);
+
+      float g1 = 1.0 - smoothstep(0.0, 0.6, abs(uHand1.y));
+      vec2 d2 = base.xz - uHand1.xz;
+      float r2 = length(d2);
+      float w2 = (1.0 - smoothstep(0.0, 0.4, r2)) * tip * g1;
+      off += (r2 > 0.001 ? d2 / r2 : vec2(0.0)) * w2 * 0.2;
+      press = max(press, w2);
+
+      vec3 pos = position;
+      pos.y *= fade;
+      pos.xz *= mix(0.35, 1.0, fade);
+
+      vec4 wpos = modelMatrix * instanceMatrix * vec4(pos, 1.0);
+      wpos.xz += off * fade;
+      wpos.y -= press * 0.12;
+      gl_Position = projectionMatrix * viewMatrix * wpos;
+    }`,
+  fragmentShader: `
+    varying float vY;
+    varying vec3 vTint;
+    void main() {
+      vec3 base = vec3(0.13, 0.26, 0.08);
+      vec3 tipC = vec3(0.40, 0.60, 0.20);
+      gl_FragColor = vec4(mix(base, tipC, vY) * vTint, 1.0);
+    }`
+});
+const grassTiles = [];
+{
+  const bladeGeo = new THREE.PlaneGeometry(0.075, 0.34, 1, 2);
+  bladeGeo.translate(0, 0.17, 0);
+  const pa = bladeGeo.attributes.position;
+  for (let i = 0; i < pa.count; i++) {
+    const t = pa.getY(i) / 0.34;
+    pa.setX(i, pa.getX(i) * (1 - 0.85 * t));   // taper to a point
+    pa.setZ(i, pa.getZ(i) + 0.06 * t * t);     // slight natural curve
+  }
+  const _m = new THREE.Matrix4(), _q = new THREE.Quaternion(), _e = new THREE.Euler();
+  const _s = new THREE.Vector3(), _p = new THREE.Vector3(), _c = new THREE.Color();
+  for (let gi = -1; gi <= 1; gi++) {
+    for (let gj = -1; gj <= 1; gj++) {
+      const mesh = new THREE.InstancedMesh(bladeGeo, grassMat, GRASS_ROWS);
+      mesh.frustumCulled = false;
+      for (let i = 0; i < GRASS_ROWS; i++) {
+        _p.set(Math.random() * GRASS_TILE, 0, Math.random() * GRASS_TILE);
+        _e.set((Math.random() - 0.5) * 0.3, Math.random() * Math.PI, (Math.random() - 0.5) * 0.3);
+        _q.setFromEuler(_e);
+        const s = 0.7 + Math.random() * 0.7;
+        _s.set(s, s, s);
+        _m.compose(_p, _q, _s);
+        mesh.setMatrixAt(i, _m);
+        _c.setHSL(0.22 + Math.random() * 0.08, 0.45 + Math.random() * 0.25, 0.42 + Math.random() * 0.25);
+        mesh.setColorAt(i, _c);
+      }
+      mesh.instanceMatrix.needsUpdate = true;
+      mesh.instanceColor.needsUpdate = true;
+      scene.add(mesh);
+      grassTiles.push({ mesh, gi, gj });
+    }
+  }
+}
+function updateGrass(px, pz) {
+  const ci = Math.floor(px / GRASS_TILE), cj = Math.floor(pz / GRASS_TILE);
+  for (const t of grassTiles)
+    t.mesh.position.set((ci + t.gi) * GRASS_TILE, 0, (cj + t.gj) * GRASS_TILE);
+}
+updateGrass(0, 0);
 
 /* ---------------- physics world ---------------- */
 const world = new CANNON.World({ gravity: new CANNON.Vec3(0, -9.82, 0) });
@@ -166,26 +322,16 @@ function solidBox(sx, sy, sz, x, y, z, color, grabbable = true) {
   return body;
 }
 
-/* floor body + invisible walls */
+/* ground body — the whole field */
 const floorBody = new CANNON.Body({
   mass: 0, material: staticMat,
-  shape: new CANNON.Box(new CANNON.Vec3(ARENA_R, 0.05, ARENA_R)),
+  shape: new CANNON.Box(new CANNON.Vec3(300, 0.05, 300)),
   position: new CANNON.Vec3(0, -0.05, 0)
 });
 world.addBody(floorBody);
 staticGrabBodies.push(floorBody);
-function wallBody(x, z, hx, hz) {
-  const b = new CANNON.Body({
-    mass: 0, material: staticMat,
-    shape: new CANNON.Box(new CANNON.Vec3(hx, 3, hz)),
-    position: new CANNON.Vec3(x, 3, z)
-  });
-  world.addBody(b);
-}
-wallBody(0, ARENA_R, ARENA_R, 0.1); wallBody(0, -ARENA_R, ARENA_R, 0.1);
-wallBody(ARENA_R, 0, 0.1, ARENA_R); wallBody(-ARENA_R, 0, 0.1, ARENA_R);
 
-/* ---------------- the map: table, crates, tower, climbing wall ---------------- */
+/* ---------------- the map: table, crates, tower, climbing wall, platform course ---------------- */
 const TABLE_TOP_Y = 0.94;
 solidBox(1.6, 0.08, 0.9, 0, TABLE_TOP_Y - 0.04, 0, WOOD);                    // tabletop
 for (const [lx, lz] of [[-1, -1], [1, -1], [-1, 1], [1, 1]])
@@ -201,8 +347,8 @@ sctx.strokeStyle = '#2d7ab3'; sctx.lineWidth = 10; sctx.strokeRect(10, 10, 492, 
 sctx.fillStyle = '#e8f0f8'; sctx.font = '900 62px sans-serif'; sctx.textAlign = 'center';
 sctx.fillText('BLOCK ROOM', 256, 112);
 sctx.fillStyle = '#7a9bb8'; sctx.font = '24px monospace';
-sctx.fillText('GRIP = GRAB · PULL = CLIMB', 256, 162);
-sctx.fillText('CLICK STICK / A = JUMP', 256, 198);
+sctx.fillText('GRIP = MOVE · TRIGGER = PICK UP', 256, 162);
+sctx.fillText('BOTH GRIPS + PUSH DOWN = JUMP', 256, 198);
 const sign = new THREE.Mesh(
   new THREE.PlaneGeometry(0.62, 0.31),
   new THREE.MeshStandardMaterial({ map: new THREE.CanvasTexture(signCv), roughness: 0.7 })
@@ -233,6 +379,14 @@ holds.forEach(([dx, y], i) => {
   solidBox(0.13, 0.13, 0.13, 0.9 + dx, y, -2.28, i % 2 ? 0x4da8da : 0xf0b429);
 });
 solidBox(1.8, 0.1, 0.45, 0.9, 2.6, -2.13, SLATE);   // top ledge
+
+/* floating parkour course — hop it, or grip the edges and climb it */
+solidBox(1.2, 0.14, 1.2, 3.2, 0.75, -1.6, SLATE);
+solidBox(1.1, 0.14, 1.1, 4.4, 1.35, -0.4, SLATE);
+solidBox(1.0, 0.14, 1.0, 4.9, 2.0, 0.9, SLATE);
+solidBox(1.0, 0.14, 1.0, 3.8, 2.6, 2.1, SLATE);
+solidBox(1.4, 0.14, 1.4, 2.2, 3.1, 2.8, SLATE);
+solidBox(1.2, 0.14, 1.2, 0.2, 3.6, 3.2, SLATE);   // summit
 
 /* ---------------- blocks ---------------- */
 const blocks = [];
@@ -281,33 +435,22 @@ playerBody.collisionFilterGroup = 2;   // never collide with hands (group 4)
 playerBody.collisionFilterMask = 1;    // collide with world + blocks only
 world.addBody(playerBody);
 
-/* visible body — matches the sketch: yellow Body box, gray Legs ball, no head */
+/* visible body — just the gray suspension ball (body hidden, no head) */
 const ballMesh = new THREE.Mesh(
   new THREE.SphereGeometry(BALL_R, 20, 14),
   new THREE.MeshStandardMaterial({ color: 0xb9bec7, roughness: 0.45 })
 );
 ballMesh.castShadow = true;
 scene.add(ballMesh);
-const torsoMesh = new THREE.Mesh(
-  new THREE.BoxGeometry(0.34, 0.55, 0.22),
-  new THREE.MeshStandardMaterial({ color: 0xf0b429, roughness: 0.5 })
-);
-torsoMesh.castShadow = true;
-scene.add(torsoMesh);
 
-/* ---------------- hands (square palms + kinematic physics spheres) ---------------- */
+/* ---------------- hands (single cube palms + kinematic physics spheres) ---------------- */
 const hands = [];
-const palmGeo = new THREE.BoxGeometry(0.085, 0.035, 0.11);
-const thumbGeo = new THREE.BoxGeometry(0.03, 0.03, 0.055);
+const handGeo = new THREE.BoxGeometry(0.095, 0.06, 0.105);
 for (let i = 0; i < 2; i++) {
   const ctrl = renderer.xr.getController(i);
   const grip = renderer.xr.getControllerGrip(i);
-  const palmMat = new THREE.MeshStandardMaterial({ color: 0xf0b429, roughness: 0.5 });
-  const palm = new THREE.Mesh(palmGeo, palmMat);
-  const thumb = new THREE.Mesh(thumbGeo, palmMat);
-  thumb.position.set(-0.05, 0, -0.015);
-  thumb.rotation.z = 0.4;
-  palm.add(thumb);
+  const handMat = new THREE.MeshStandardMaterial({ color: 0xf0b429, roughness: 0.5 });
+  const palm = new THREE.Mesh(handGeo, handMat);
   grip.add(palm);
   dolly.add(ctrl); dolly.add(grip);
   const body = new CANNON.Body({
@@ -321,15 +464,19 @@ for (let i = 0; i < 2; i++) {
   world.addBody(body);
   const h = {
     ctrl, grip, palm, body, src: null,
-    worldLock: null,    // CANNON.Vec3 anchor when gripping the world
-    heldBlock: null,    // block record when gripping a block
+    worldLock: null,    // anchor when gripping a solid surface (climb / push off)
+    airLock: null,      // anchor when gripping thin air (grip movement)
+    heldBlock: null,    // block record when trigger-grabbing a block
     closed: false,
-    hovered: null
+    hovered: null,
+    gripVy: 0, prevGripY: null
   };
   ctrl.addEventListener('connected', e => { h.src = e.data; });
   ctrl.addEventListener('disconnected', () => { h.src = null; });
-  ctrl.addEventListener('squeezestart', () => gripStart(h));
-  ctrl.addEventListener('squeezeend', () => gripEnd(h));
+  ctrl.addEventListener('selectstart', () => grabBlock(h));    // trigger: pick up
+  ctrl.addEventListener('selectend', () => releaseBlock(h));
+  ctrl.addEventListener('squeezestart', () => gripDown(h));    // grip: climb / move
+  ctrl.addEventListener('squeezeend', () => gripUp(h));
   hands.push(h);
 }
 
@@ -371,7 +518,30 @@ function setGlow(rec, on) {
   rec.mesh.material.emissive.setHex(on ? 0x2a3a55 : 0x000000);
 }
 
-function gripStart(h) {
+/* grip = grab a solid surface to climb/push off, or grab the air to move */
+function gripDown(h) {
+  if (!renderer.xr.isPresenting) return;
+  const pos = new THREE.Vector3();
+  h.grip.getWorldPosition(pos);
+  const stat = nearestStatic(pos, GRAB_WORLD_R);
+  if (stat) {
+    h.worldLock = new CANNON.Vec3(pos.x, pos.y, pos.z);
+    buzz(h, 60, 0.8);
+  } else {
+    h.airLock = new CANNON.Vec3(pos.x, pos.y, pos.z);
+    buzz(h, 20, 0.3);
+  }
+  setHandClosed(h, true);
+}
+
+function gripUp(h) {
+  h.worldLock = null;
+  h.airLock = null;          // momentum stays → glide / swing / launch
+  setHandClosed(h, false);
+}
+
+/* trigger = pick up / drop blocks */
+function grabBlock(h) {
   if (!renderer.xr.isPresenting) return;
   const pos = new THREE.Vector3();
   h.grip.getWorldPosition(pos);
@@ -383,26 +553,18 @@ function gripStart(h) {
     setGlow(rec, true);
     setHandClosed(h, true);
     buzz(h);
-    return;
-  }
-  const stat = nearestStatic(pos, GRAB_WORLD_R);
-  if (stat) {
-    h.worldLock = new CANNON.Vec3(pos.x, pos.y, pos.z);
-    setHandClosed(h, true);
-    buzz(h, 60, 0.8);
   }
 }
 
-function gripEnd(h) {
+function releaseBlock(h) {
   if (h.heldBlock) {
     const rec = h.heldBlock;
     rec.held = false; rec.heldBy = null;
     setGlow(rec, false);
     rec.body.wakeUp();          // velocity already tracks the hand → natural throw
     h.heldBlock = null;
+    setHandClosed(h, false);
   }
-  if (h.worldLock) h.worldLock = null;   // momentum stays → swing / launch
-  setHandClosed(h, false);
 }
 
 function releaseAll() {
@@ -415,6 +577,7 @@ function releaseAll() {
   for (const h of hands) {
     h.heldBlock = null;
     h.worldLock = null;
+    h.airLock = null;
     setHandClosed(h, false);
   }
   mouseGrab = null;
@@ -519,64 +682,10 @@ function desktopRelease() {
   }
 }
 
-/* ---------------- jump & leg-ball suspension ---------------- */
-let grounded = false, coyote = 0, jumpCooldown = 0, wasJumpHeld = false;
-let susC = 0, susV = 0, prevBallVy = 0;   // suspension compression state
-
-function computeGrounded() {
-  for (const c of world.contacts) {
-    if (c.bi !== playerBody && c.bj !== playerBody) continue;
-    if (Math.abs(c.ni.y) > 0.5) return true;   // any up/down support contact
-  }
-  return false;
-}
-
-function tryJump() {
-  if (jumpCooldown > 0 || coyote <= 0) return;
-  if (hands.some(h => h.worldLock)) return;   // busy climbing
-  playerBody.velocity.y = JUMP_V;
-  coyote = 0;
-  jumpCooldown = 0.45;
-  susV += 1.2;                                // legs extend into the jump
-}
-
-function pollJumpHeld() {
-  const s = renderer.xr.getSession?.();
-  if (!s) return false;
-  for (const src of s.inputSources) {
-    const gp = src.gamepad;
-    if (!gp) continue;
-    if (gp.buttons[3]?.pressed || gp.buttons[4]?.pressed) return true;  // stick click / A-X
-  }
-  return false;
-}
-
-function handleJump(dt) {
-  jumpCooldown = Math.max(0, jumpCooldown - dt);
-  coyote = grounded ? 0.12 : Math.max(0, coyote - dt);
-  const held = pollJumpHeld();
-  if (held && !wasJumpHeld) tryJump();
-  wasJumpHeld = held;
-  if (keys.Space) tryJump();
-}
-
-function updateSuspension(dt) {
-  if (dt <= 0) return;
-  const vy = playerBody.velocity.y;
-  const aBall = Math.max(-80, Math.min(80, (vy - prevBallVy) / dt));
-  prevBallVy = vy;
-  /* head rides a spring-damper above the ball: compress on impact, recover after */
-  susV += (-SUS_W * SUS_W * susC - SUS_D * susV + aBall) * dt;
-  susC += susV * dt;
-  if (susC < -0.2) { susC = -0.2; susV = Math.min(susV, 0); }
-  if (susC > 0.55) { susC = 0.55; susV = Math.max(susV, 0); }
-}
-
-/* ---------------- locomotion & climbing ---------------- */
+/* ---------------- locomotion: grip locks (world + air), stick walk ---------------- */
 const UP = new THREE.Vector3(0, 1, 0);
 const _fwd = new THREE.Vector3(), _right = new THREE.Vector3();
 const _p = new THREE.Vector3(), _hp = new THREE.Vector3(), _hq = new THREE.Quaternion();
-const _e = new THREE.Euler();
 const _v = new THREE.Vector3(), _d = new THREE.Vector3();
 let prevHead = null;         // previous headset local XZ (null until first pose)
 let snapCooldown = 0;
@@ -601,15 +710,17 @@ function readSticks() {
 function updateLocomotion(dt) {
   snapCooldown = Math.max(0, snapCooldown - dt);
 
-  /* climbing locks work in both modes: spring the body toward each anchor */
-  const locks = hands.filter(h => h.worldLock);
+  /* every held grip pulls the body toward its anchor —
+     world anchors are stiff (climb), air anchors are soft (grip movement) */
+  const locks = hands.filter(h => h.worldLock || h.airLock);
   let lockVel = null;
   if (locks.length) {
     _v.set(0, 0, 0);
     for (const h of locks) {
       h.grip.getWorldPosition(_hp);
-      _d.set(h.worldLock.x - _hp.x, h.worldLock.y - _hp.y, h.worldLock.z - _hp.z);
-      _d.multiplyScalar(SPRING);
+      const a = h.worldLock || h.airLock;
+      _d.set(a.x - _hp.x, a.y - _hp.y, a.z - _hp.z);
+      _d.multiplyScalar(h.worldLock ? SPRING : AIR_SPRING);
       if (_d.length() > LOCK_VCAP) _d.setLength(LOCK_VCAP);
       _v.add(_d);
     }
@@ -667,6 +778,76 @@ function updateLocomotion(dt) {
   }
 }
 
+/* ---------------- jump (both grips + push down) & ball suspension ---------------- */
+let grounded = false, coyote = 0, jumpCooldown = 0, wasJumpHeld = false;
+let susC = 0, susV = 0, prevBallVy = 0;   // suspension compression state
+let dgCooldown = 0;
+
+function computeGrounded() {
+  for (const c of world.contacts) {
+    if (c.bi !== playerBody && c.bj !== playerBody) continue;
+    if (Math.abs(c.ni.y) > 0.5) return true;   // any up/down support contact
+  }
+  return false;
+}
+
+function tryJump(force = false) {
+  if (jumpCooldown > 0) return;
+  if (!force && coyote <= 0) return;
+  if (hands.some(h => h.worldLock)) return;   // busy climbing a surface
+  playerBody.velocity.y = JUMP_V;
+  coyote = 0;
+  jumpCooldown = 0.45;
+  susV += 1.2;                                // legs extend into the jump
+}
+
+/* the jump gesture: both grips holding air, both hands shoved downward */
+function checkDoubleGripJump(dt) {
+  dgCooldown = Math.max(0, dgCooldown - dt);
+  if (dgCooldown > 0) return;
+  const a = hands.filter(h => h.airLock);
+  if (a.length !== 2) return;
+  let down = 0;
+  for (const h of a) if ((h.gripVy || 0) < -1.1) down++;
+  if (down === 2) {
+    tryJump(true);
+    dgCooldown = 0.6;
+  }
+}
+
+function pollJumpHeld() {
+  const s = renderer.xr.getSession?.();
+  if (!s) return false;
+  for (const src of s.inputSources) {
+    const gp = src.gamepad;
+    if (!gp) continue;
+    if (gp.buttons[3]?.pressed || gp.buttons[4]?.pressed) return true;  // stick click / A-X
+  }
+  return false;
+}
+
+function handleJump(dt) {
+  jumpCooldown = Math.max(0, jumpCooldown - dt);
+  coyote = grounded ? 0.12 : Math.max(0, coyote - dt);
+  checkDoubleGripJump(dt);
+  const held = pollJumpHeld();
+  if (held && !wasJumpHeld) tryJump();
+  wasJumpHeld = held;
+  if (keys.Space) tryJump();
+}
+
+function updateSuspension(dt) {
+  if (dt <= 0) return;
+  const vy = playerBody.velocity.y;
+  const aBall = Math.max(-SUS_A_MAX, Math.min(SUS_A_MAX, (vy - prevBallVy) / dt));
+  prevBallVy = vy;
+  /* the leg is a real spring: every push, pull and landing compresses it */
+  susV += (-SUS_W * SUS_W * susC - SUS_D * susV + aBall) * dt;
+  susC += susV * dt;
+  if (susC < SUS_MIN) { susC = SUS_MIN; susV = Math.min(susV, 0); }
+  if (susC > SUS_MAX) { susC = SUS_MAX; susV = Math.max(susV, 0); }
+}
+
 /* ---------------- held blocks & hand physics ---------------- */
 const _tQuat = new THREE.Quaternion();
 const _cQuat = new CANNON.Quaternion();
@@ -677,10 +858,12 @@ function updateHands(dt) {
       /* park hand bodies out of the world when there is no session */
       h.body.velocity.set(0, 0, 0);
       h.body.position.set(0, -50, 0);
+      h.gripVy = 0;
       continue;
     }
     h.grip.getWorldPosition(_hp);
-    h.grip.getWorldQuaternion(_hq);
+    h.gripVy = dt > 0 ? (_hp.y - (h.prevGripY ?? _hp.y)) / dt : 0;
+    h.prevGripY = _hp.y;
     /* kinematic hand body follows the controller → can shove blocks */
     _v.set(_hp.x - h.body.position.x, _hp.y - h.body.position.y, _hp.z - h.body.position.z);
     const spd = Math.min(_v.length() / Math.max(dt, 0.001), 15);
@@ -765,21 +948,34 @@ function tick(dt) {
     playerBody.velocity.set(0, 0, 0);
   }
 
-  /* body visuals: gray ball leg + yellow torso riding the suspension */
+  /* gray suspension ball follows the physics body */
   ballMesh.position.set(playerBody.position.x, playerBody.position.y, playerBody.position.z);
-  const legLen = Math.max(0.3, camera.position.y - BALL_R - susC);
-  torsoMesh.position.set(playerBody.position.x,
-    playerBody.position.y + 0.55 * legLen, playerBody.position.z);
-  camera.getWorldQuaternion(_hq);
-  _e.setFromQuaternion(_hq, 'YXZ');
-  torsoMesh.rotation.set(0, _e.y, 0);
 
-  /* camera = ball + suspension + real headset offset (dips on landing) */
+  /* camera = ball + suspension + real headset offset (dips on push/landing) */
   dolly.position.set(
     playerBody.position.x - camera.position.x,
     playerBody.position.y - BALL_R - susC,
     playerBody.position.z - camera.position.z
   );
+
+  /* grass + sky follow the player */
+  grassUniforms.uTime.value += dt;
+  grassUniforms.uPlayer.value.set(playerBody.position.x, playerBody.position.y, playerBody.position.z);
+  if (renderer.xr.isPresenting) {
+    hands[0].grip.getWorldPosition(_hp);
+    grassUniforms.uHand0.value.copy(_hp);
+    hands[1].grip.getWorldPosition(_hp);
+    grassUniforms.uHand1.value.copy(_hp);
+  } else {
+    grassUniforms.uHand0.value.set(0, -100, 0);
+    grassUniforms.uHand1.value.set(0, -100, 0);
+  }
+  updateGrass(playerBody.position.x, playerBody.position.z);
+  skyDome.position.set(playerBody.position.x, 0, playerBody.position.z);
+  sunSprite.position.set(playerBody.position.x, 0, playerBody.position.z).addScaledVector(SUN_DIR, 500);
+  sunCore.position.copy(sunSprite.position);
+  sun.position.set(playerBody.position.x + 26, 44, playerBody.position.z + 14);
+  sun.target.position.set(playerBody.position.x, 0, playerBody.position.z);
 
   updateHover();
 }
@@ -798,7 +994,8 @@ addEventListener('resize', () => {
 /* debug hook for headless tests (harmless in normal use) */
 window.__BR = {
   playerBody, blocks, hands, world, CANNON, TABLE_TOP_Y, BALL_R,
-  gripStart, gripEnd, tick, keys, tryJump, ballMesh, torsoMesh,
+  gripDown, gripUp, grabBlock, releaseBlock, tryJump, handleJump, tick, keys,
+  ballMesh, grassTiles, grassUniforms, skyDome, sunSprite,
   get desktop() { return desktop; },
   get grounded() { return grounded; },
   get susC() { return susC; },
@@ -809,7 +1006,7 @@ window.__BR = {
 if (navigator.xr) {
   navigator.xr.isSessionSupported('immersive-vr').then(ok => {
     status.textContent = ok
-      ? 'Headset detected — grip button grabs, pull to climb.'
+      ? 'Headset detected — grip the air to move, both grips + push down to jump.'
       : 'No VR headset found — ENTER VR starts desktop mode instead.';
   }).catch(() => { status.textContent = 'WebXR check failed — desktop mode available.'; });
 } else {
