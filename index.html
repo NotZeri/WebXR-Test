@@ -45,10 +45,10 @@
     <div class="kicker">WebXR · Full-Physics Sandbox</div>
     <h1>BLOCK ROOM</h1>
     <p class="sub">A grassy field, your own physics body — and <b>Bonelab-style hands</b>.
-      Grab the air and pull yourself around, push off anything, climb anything.</p>
+      Stroke the air to move, grab and climb anything, push off walls with your palms.</p>
     <div class="ctrls">
-      <div><b>In VR</b>Hold <b>GRIP</b> &amp; pull the air — move<br>Grab a solid surface &amp; pull — climb / push off<br>Hold <b>BOTH grips</b>, push down — jump<br><b>TRIGGER</b> — pick up blocks · Right stick — turn</div>
-      <div><b>On desktop</b>Click — lock mouse · W A S D — move<br>Space — jump<br>Hold mouse — grab blocks / climb<br>Esc — release mouse</div>
+      <div><b>In VR</b>Hold <b>GRIP</b>, stroke the air — move<br>Grip a solid — climb · hang · push off anything<br>Hold <b>BOTH grips</b>, push down — jump<br><b>TRIGGER</b> — pick up blocks<br>Point at left-wrist menu + TRIGGER — spawn props</div>
+      <div><b>On desktop</b>Click — lock mouse · W A S D — move<br>Space — jump · 1–4 — spawn props<br>Hold mouse — grab blocks / climb<br>Esc — release mouse</div>
     </div>
     <button id="btn">ENTER VR</button>
     <div id="status">Checking for WebXR…</div>
@@ -70,19 +70,25 @@ import * as CANNON from 'cannon-es';
 
 /* ---------------- constants ---------------- */
 const BALL_R = 0.25, PLAYER_MASS = 70;   // the player: gray ball "leg" + camera above
+const HAND_MASS = 1.2;                   // each hand is a real dynamic body
 const JUMP_V = 5.2;                      // jump impulse → ~1.4 m apex
 const SUS_W = 16, SUS_D = 10;            // suspension spring: ω and 2ζω
 const SUS_A_MAX = 200, SUS_MIN = -0.3, SUS_MAX = 0.45;   // leg compression range
-const WALK_SPEED = 3.0, CLIMB_STEER = 1.5;
+const WALK_SPEED = 3.0, AIR_CTRL = 0.35, STICK_RESP = 10;
 const GRAB_BLOCK_R = 0.22;     // trigger → block pick-up radius
-const GRAB_WORLD_R = 0.11;     // grip → static surface proximity
-const SPRING = 26;             // world-climb lock stiffness
-const AIR_SPRING = 12;         // grip-the-air movement stiffness
-const LOCK_VCAP = 12;          // max lock velocity
-const FOLLOW = 25, VMAX = 10;  // held-block follow
+const GRAB_WORLD_R = 0.14;     // grip → solid surface proximity (pin = climb)
+const FOLLOW_H = 30, SERVO_VMAX = 9;     // hand servo toward the controller
+const SPRING = 26, LOCK_VCAP = 12;       // pinned-hand climb pull
+const CLIMB_STEER = 1.5;                 // stick steer while gripping
+const PUSH_F_MAX = 500;                  // blocked-hand push-off reaction (N)
+const AIR_GAIN = 2.2, AIR_MAX = 7;       // grip-the-air paddle thrust (m/s²)
+const HEAD_FOLLOW = 12;                  // body re-centers under the head (1/s)
+const FOLLOW = 25, VMAX = 10;            // held-block follow
 const SNAP_ANGLE = Math.PI / 4;
 const COLORS = [0xe2574c, 0x4da8da, 0x67c23a, 0xf0b429, 0x9b7ede, 0xe8833a];
 const WOOD = 0x8a6a4f, SLATE = 0x46586e, PILLAR = 0x3a4a5e;
+/* collision groups */
+const G_STATIC = 1, G_PLAYER = 2, G_HAND = 4, G_BLOCK = 8, G_DUMMY = 16;
 
 /* ---------------- three.js scene: sky, sun, grass field ---------------- */
 const scene = new THREE.Scene();
@@ -288,6 +294,7 @@ function updateGrass(px, pz) {
     t.mesh.position.set((ci + t.gi) * GRASS_TILE, 0, (cj + t.gj) * GRASS_TILE);
 }
 updateGrass(0, 0);
+/* ==== PART2 ==== */
 
 /* ---------------- physics world ---------------- */
 const world = new CANNON.World({ gravity: new CANNON.Vec3(0, -9.82, 0) });
@@ -297,11 +304,20 @@ world.defaultContactMaterial.friction = 0.4;
 world.defaultContactMaterial.restitution = 0.05;
 const playerMat = new CANNON.Material('player');
 const staticMat = new CANNON.Material('static');
+/* Ball friction ≈ 0: the ball's motion is fully velocity-authored (walk / climb /
+   paddle / push-off), and cannon-es' friction clamp is inflated by 1/dt — any real
+   coefficient here eats most of the authored velocity every step. */
 world.addContactMaterial(new CANNON.ContactMaterial(playerMat, staticMat,
-  { friction: 0.05, restitution: 0 }));
+  { friction: 0.001, restitution: 0 }));
+/* dummies: gentle ground contact so tipping over looks natural instead of
+   slamming to rest mid-fall (same inflated-clamp issue, milder coefficient) */
+const dummyMat = new CANNON.Material('dummy');
+world.addContactMaterial(new CANNON.ContactMaterial(dummyMat, staticMat,
+  { friction: 0.02, restitution: 0 }));
 
-const staticGrabBodies = [];   // world geometry the hands can grip
-const staticMeshes = [];       // same geometry as meshes (desktop climb raycast)
+const staticGrabBodies = [];   // world geometry hands can pin to
+const staticSet = new Set();   // fast static lookup for blocked-hand detection
+const staticMeshes = [];       // desktop climb raycast targets
 function solidBox(sx, sy, sz, x, y, z, color, grabbable = true) {
   const mesh = new THREE.Mesh(
     new THREE.BoxGeometry(sx, sy, sz),
@@ -313,23 +329,27 @@ function solidBox(sx, sy, sz, x, y, z, color, grabbable = true) {
   const body = new CANNON.Body({
     mass: 0,
     material: staticMat,
+    collisionFilterGroup: G_STATIC,
+    collisionFilterMask: -1,
     shape: new CANNON.Box(new CANNON.Vec3(sx / 2, sy / 2, sz / 2)),
     position: new CANNON.Vec3(x, y, z)
   });
   world.addBody(body);
   staticMeshes.push(mesh);
-  if (grabbable) staticGrabBodies.push(body);
+  if (grabbable) { staticGrabBodies.push(body); staticSet.add(body.id); }
   return body;
 }
 
 /* ground body — the whole field */
 const floorBody = new CANNON.Body({
   mass: 0, material: staticMat,
+  collisionFilterGroup: G_STATIC, collisionFilterMask: -1,
   shape: new CANNON.Box(new CANNON.Vec3(300, 0.05, 300)),
   position: new CANNON.Vec3(0, -0.05, 0)
 });
 world.addBody(floorBody);
 staticGrabBodies.push(floorBody);
+staticSet.add(floorBody.id);
 
 /* ---------------- the map: table, crates, tower, climbing wall, platform course ---------------- */
 const TABLE_TOP_Y = 0.94;
@@ -346,8 +366,8 @@ sctx.fillStyle = '#10233a'; sctx.fillRect(0, 0, 512, 256);
 sctx.strokeStyle = '#2d7ab3'; sctx.lineWidth = 10; sctx.strokeRect(10, 10, 492, 236);
 sctx.fillStyle = '#e8f0f8'; sctx.font = '900 62px sans-serif'; sctx.textAlign = 'center';
 sctx.fillText('BLOCK ROOM', 256, 112);
-sctx.fillStyle = '#7a9bb8'; sctx.font = '24px monospace';
-sctx.fillText('GRIP = MOVE · TRIGGER = PICK UP', 256, 162);
+sctx.fillStyle = '#7a9bb8'; sctx.font = '22px monospace';
+sctx.fillText('GRIP AIR = MOVE · TRIGGER = PICK UP', 256, 162);
 sctx.fillText('BOTH GRIPS + PUSH DOWN = JUMP', 256, 198);
 const sign = new THREE.Mesh(
   new THREE.PlaneGeometry(0.62, 0.31),
@@ -399,6 +419,7 @@ function addBlock(x, y, z, color) {
   scene.add(mesh);
   const body = new CANNON.Body({
     mass: 0.5,
+    collisionFilterGroup: G_BLOCK, collisionFilterMask: -1,
     shape: new CANNON.Box(new CANNON.Vec3(0.07, 0.07, 0.07)),
     position: new CANNON.Vec3(x, y, z),
     linearDamping: 0.05,
@@ -410,6 +431,7 @@ function addBlock(x, y, z, color) {
   const rec = { mesh, body, held: false, heldBy: null };
   body.userData = rec;
   blocks.push(rec);
+  return rec;
 }
 let ci = 0;
 const nextColor = () => COLORS[ci++ % COLORS.length];
@@ -428,14 +450,14 @@ const playerBody = new CANNON.Body({
   fixedRotation: true,
   linearDamping: 0.01,
   material: playerMat,
+  collisionFilterGroup: G_PLAYER,
+  collisionFilterMask: G_STATIC | G_BLOCK | G_DUMMY,
   position: new CANNON.Vec3(0, BALL_R, 2.4)
 });
 playerBody.allowSleep = false;
-playerBody.collisionFilterGroup = 2;   // never collide with hands (group 4)
-playerBody.collisionFilterMask = 1;    // collide with world + blocks only
 world.addBody(playerBody);
 
-/* visible body — just the gray suspension ball (body hidden, no head) */
+/* visible body — just the gray suspension ball (rest of the body hidden) */
 const ballMesh = new THREE.Mesh(
   new THREE.SphereGeometry(BALL_R, 20, 14),
   new THREE.MeshStandardMaterial({ color: 0xb9bec7, roughness: 0.45 })
@@ -443,7 +465,7 @@ const ballMesh = new THREE.Mesh(
 ballMesh.castShadow = true;
 scene.add(ballMesh);
 
-/* ---------------- hands (single cube palms + kinematic physics spheres) ---------------- */
+/* ---------------- hands: real dynamic bodies servo'd to the controllers ---------------- */
 const hands = [];
 const handGeo = new THREE.BoxGeometry(0.095, 0.06, 0.105);
 for (let i = 0; i < 2; i++) {
@@ -454,31 +476,87 @@ for (let i = 0; i < 2; i++) {
   grip.add(palm);
   dolly.add(ctrl); dolly.add(grip);
   const body = new CANNON.Body({
-    mass: 0, type: CANNON.Body.KINEMATIC,
-    shape: new CANNON.Sphere(0.06),
-    position: new CANNON.Vec3(0, 1.4, 2.4)
+    mass: HAND_MASS,
+    shape: new CANNON.Sphere(0.07),
+    linearDamping: 0.35,
+    angularDamping: 0.6,
+    collisionFilterGroup: G_HAND,
+    collisionFilterMask: G_STATIC | G_BLOCK | G_DUMMY,
+    position: new CANNON.Vec3(0, -50, 0)
   });
   body.allowSleep = false;
-  body.collisionFilterGroup = 4;   // hands never push the player body
-  body.collisionFilterMask = 1;    // hands push blocks + world only
   world.addBody(body);
   const h = {
     ctrl, grip, palm, body, src: null,
-    worldLock: null,    // anchor when gripping a solid surface (climb / push off)
-    airLock: null,      // anchor when gripping thin air (grip movement)
+    pinned: false,      // gripping a solid: hand welded to an anchor (climb / hang)
+    anchor: null,       // CANNON.Vec3 pin point
+    airGrip: false,     // gripping air: paddle thrust (move / push-up)
     heldBlock: null,    // block record when trigger-grabbing a block
     closed: false,
     hovered: null,
+    testTarget: null,   // optional override of the controller pose (tests / desktop)
     gripVy: 0, prevGripY: null
   };
   ctrl.addEventListener('connected', e => { h.src = e.data; });
   ctrl.addEventListener('disconnected', () => { h.src = null; });
-  ctrl.addEventListener('selectstart', () => grabBlock(h));    // trigger: pick up
+  ctrl.addEventListener('selectstart', () => {
+    if (renderer.xr.isPresenting && menuHover >= 0) spawnFromMenu();
+    else grabBlock(h);
+  });
   ctrl.addEventListener('selectend', () => releaseBlock(h));
   ctrl.addEventListener('squeezestart', () => gripDown(h));    // grip: climb / move
   ctrl.addEventListener('squeezeend', () => gripUp(h));
   hands.push(h);
 }
+
+/* ---------------- spawn menu on the left wrist ---------------- */
+const MENU_W = 0.26, MENU_H = 0.2;
+const menuCv = document.createElement('canvas');
+menuCv.width = 256; menuCv.height = 200;
+const mctx = menuCv.getContext('2d');
+function drawMenu(hover) {
+  mctx.fillStyle = '#0d1626'; mctx.fillRect(0, 0, 256, 200);
+  mctx.strokeStyle = hover >= 0 ? '#67c23a' : '#2d7ab3';
+  mctx.lineWidth = 6; mctx.strokeRect(3, 3, 250, 194);
+  mctx.fillStyle = '#7a9bb8'; mctx.font = '700 18px sans-serif';
+  mctx.textAlign = 'left'; mctx.fillText('SPAWN', 14, 26);
+  const items = [
+    { n: 'BLOCK', c: '#4da8da' }, { n: 'CRATE', c: '#8a6a4f' },
+    { n: 'BALL',  c: '#e2574c' }, { n: 'BUDDY', c: '#e8833a' }
+  ];
+  for (let i = 0; i < 4; i++) {
+    const cx = 18 + (i % 2) * 120, cy = 46 + Math.floor(i / 2) * 74;
+    mctx.fillStyle = i === hover ? 'rgba(103,194,58,0.28)' : 'rgba(45,122,179,0.12)';
+    mctx.fillRect(cx, cy, 108, 64);
+    mctx.strokeStyle = i === hover ? '#67c23a' : '#223047';
+    mctx.lineWidth = 3; mctx.strokeRect(cx, cy, 108, 64);
+    /* icon */
+    mctx.fillStyle = items[i].c;
+    if (i === 2) { mctx.beginPath(); mctx.arc(cx + 54, cy + 24, 14, 0, 7); mctx.fill(); }
+    else if (i === 3) {
+      mctx.beginPath(); mctx.arc(cx + 54, cy + 14, 8, 0, 7); mctx.fill();
+      mctx.fillRect(cx + 46, cy + 24, 16, 26);
+    } else mctx.fillRect(cx + 40, cy + 12, 28, 26);
+    mctx.fillStyle = '#e8f0f8'; mctx.font = '700 15px sans-serif'; mctx.textAlign = 'center';
+    mctx.fillText(items[i].n, cx + 54, cy + 56);
+  }
+}
+drawMenu(-1);
+const menuTex = new THREE.CanvasTexture(menuCv);
+const menuPanel = new THREE.Mesh(
+  new THREE.PlaneGeometry(MENU_W, MENU_H),
+  new THREE.MeshBasicMaterial({ map: menuTex, transparent: false })
+);
+menuPanel.position.set(0, 0.1, 0.05);
+menuPanel.rotation.x = -1.15;
+hands[0].grip.add(menuPanel);
+const menuCursor = new THREE.Mesh(
+  new THREE.SphereGeometry(0.012, 8, 8),
+  new THREE.MeshBasicMaterial({ color: 0x67c23a })
+);
+menuCursor.visible = false;
+menuPanel.add(menuCursor);
+let menuHover = -1, lastMenuHover = -2;
 
 function buzz(h, ms = 40, power = 0.5) {
   h.src?.gamepad?.hapticActuators?.[0]?.pulse(power, ms);
@@ -518,25 +596,40 @@ function setGlow(rec, on) {
   rec.mesh.material.emissive.setHex(on ? 0x2a3a55 : 0x000000);
 }
 
-/* grip = grab a solid surface to climb/push off, or grab the air to move */
+/* grip = pin a solid surface (climb / hang / pull), or grab the air to paddle */
 function gripDown(h) {
   if (!renderer.xr.isPresenting) return;
-  const pos = new THREE.Vector3();
-  h.grip.getWorldPosition(pos);
-  const stat = nearestStatic(pos, GRAB_WORLD_R);
+  h.grip.getWorldPosition(_hp);
+  const stat = nearestStatic(_hp, GRAB_WORLD_R);
   if (stat) {
-    h.worldLock = new CANNON.Vec3(pos.x, pos.y, pos.z);
+    h.pinned = true;
+    h.anchor = new CANNON.Vec3(_hp.x, _hp.y, _hp.z);
+    h.body.type = CANNON.Body.KINEMATIC;
+    h.body.velocity.set(0, 0, 0);
+    h.body.position.set(_hp.x, _hp.y, _hp.z);
     buzz(h, 60, 0.8);
   } else {
-    h.airLock = new CANNON.Vec3(pos.x, pos.y, pos.z);
+    h.airGrip = true;
     buzz(h, 20, 0.3);
   }
   setHandClosed(h, true);
 }
 
 function gripUp(h) {
-  h.worldLock = null;
-  h.airLock = null;          // momentum stays → glide / swing / launch
+  if (h.pinned) {
+    h.pinned = false;
+    h.anchor = null;
+    h.body.type = CANNON.Body.DYNAMIC;
+    h.body.wakeUp();
+    /* let the hand spring back toward the controller */
+    h.grip.getWorldPosition(_hp);
+    h.body.velocity.set(
+      (_hp.x - h.body.position.x) * 8,
+      (_hp.y - h.body.position.y) * 8,
+      (_hp.z - h.body.position.z) * 8
+    );
+  }
+  h.airGrip = false;         // released air keeps the momentum you built up
   setHandClosed(h, false);
 }
 
@@ -576,12 +669,18 @@ function releaseAll() {
   }
   for (const h of hands) {
     h.heldBlock = null;
-    h.worldLock = null;
-    h.airLock = null;
+    h.airGrip = false;
+    if (h.pinned) {
+      h.pinned = false;
+      h.anchor = null;
+      h.body.type = CANNON.Body.DYNAMIC;
+      h.body.wakeUp();
+    }
     setHandClosed(h, false);
   }
   mouseGrab = null;
 }
+/* ==== PART3 ==== */
 
 /* ---------------- VR session ---------------- */
 const overlay = document.getElementById('overlay');
@@ -633,10 +732,28 @@ function startDesktop() {
   overlay.classList.add('hidden');
   try { renderer.domElement.requestPointerLock?.()?.catch?.(() => {}); } catch (e) {}
 }
-addEventListener('keydown', e => { keys[e.code] = true; });
+addEventListener('keydown', e => {
+  keys[e.code] = true;
+  /* desktop spawn keys: 1 block · 2 crate · 3 ball · 4 buddy */
+  if (desktop && !renderer.xr.isPresenting) {
+    const idx = ['Digit1', 'Digit2', 'Digit3', 'Digit4'].indexOf(e.code);
+    if (idx >= 0) {
+      raycaster.setFromCamera(new THREE.Vector2(0, 0), camera);
+      raycaster.far = 3.5;
+      const hits = raycaster.intersectObjects(staticMeshes, false);
+      camera.getWorldDirection(_fwd);
+      camera.getWorldPosition(_p);
+      const pos = hits.length
+        ? { x: hits[0].point.x, y: hits[0].point.y + 0.4, z: hits[0].point.z }
+        : { x: _p.x + _fwd.x * 1.6, y: _p.y + _fwd.y * 1.6, z: _p.z + _fwd.z * 1.6 };
+      spawnItem(idx, pos);
+    }
+  }
+});
 addEventListener('keyup',   e => { keys[e.code] = false; });
 addEventListener('mousemove', e => {
   if (!desktop || document.pointerLockElement !== renderer.domElement) return;
+  if (Math.abs(e.movementX) > 300 || Math.abs(e.movementY) > 300) return;  // warp guard
   yaw   -= e.movementX * 0.0022;
   pitch -= e.movementY * 0.0022;
   pitch = Math.max(-1.45, Math.min(1.45, pitch));
@@ -665,8 +782,13 @@ function desktopGrab() {
     setGlow(rec, true);
     return;
   }
-  /* clicked world geometry → climb anchor on the first hand */
-  hands[0].worldLock = new CANNON.Vec3(hit.point.x, hit.point.y, hit.point.z);
+  /* clicked world geometry → pin the first hand there (climb / hang) */
+  const h = hands[0];
+  h.pinned = true;
+  h.anchor = new CANNON.Vec3(hit.point.x, hit.point.y, hit.point.z);
+  h.body.type = CANNON.Body.KINEMATIC;
+  h.body.velocity.set(0, 0, 0);
+  h.body.position.set(hit.point.x, hit.point.y, hit.point.z);
   mouseClimb = true;
 }
 function desktopRelease() {
@@ -677,22 +799,24 @@ function desktopRelease() {
     mouseGrab = null;
   }
   if (mouseClimb) {
-    hands[0].worldLock = null;
+    const h = hands[0];
+    h.pinned = false;
+    h.anchor = null;
+    h.body.type = CANNON.Body.DYNAMIC;
+    h.body.wakeUp();
     mouseClimb = false;
   }
 }
 
-/* ---------------- locomotion: grip locks (world + air), stick walk ---------------- */
+/* ---------------- locomotion: view-relative stick, snap turn ---------------- */
 const UP = new THREE.Vector3(0, 1, 0);
 const _fwd = new THREE.Vector3(), _right = new THREE.Vector3();
-const _p = new THREE.Vector3(), _hp = new THREE.Vector3(), _hq = new THREE.Quaternion();
-const _v = new THREE.Vector3(), _d = new THREE.Vector3();
-let prevHead = null;         // previous headset local XZ (null until first pose)
+const _p = new THREE.Vector3(), _hp = new THREE.Vector3(), _hp2 = new THREE.Vector3();
+const _hq = new THREE.Quaternion(), _q = new THREE.Quaternion();
+const _v = new THREE.Vector3(), _d = new THREE.Vector3(), _pv = new THREE.Vector3();
+let prevHead = null;         // previous headset local XZ (kept for VR sessions)
 let snapCooldown = 0;
-
-function snapTurn(angle) {
-  dolly.quaternion.premultiply(new THREE.Quaternion().setFromAxisAngle(UP, angle));
-}
+const blockedHands = new Set();   // hand bodies touching statics (push-off source)
 
 function readSticks() {
   let mx = 0, my = 0, tx = 0;
@@ -707,26 +831,47 @@ function readSticks() {
   return { mx, my, tx };
 }
 
+const dead = v => Math.abs(v) > 0.15 ? v : 0;
+function deadStick() {
+  if (!renderer.xr.isPresenting) return { sx: 0, sz: 0 };
+  const { mx, my } = readSticks();
+  return { sx: dead(mx), sz: dead(my) };
+}
+
+/* rig origin: head stays glued above the ball (rotation-aware XZ), rig height
+   at the feet. Real walking is tracked by followHead via the LOCAL head delta. */
+function syncDolly() {
+  _v.set(camera.position.x, 0, camera.position.z).applyQuaternion(dolly.quaternion);
+  dolly.position.set(
+    playerBody.position.x - _v.x,
+    playerBody.position.y - BALL_R - susC,
+    playerBody.position.z - _v.z
+  );
+}
+
+/* snap turn: pure view rotation — the head never leaves the ball (no leg offset) */
+function snapTurn(angle) {
+  dolly.quaternion.premultiply(_q.setFromAxisAngle(UP, angle));
+  syncDolly();
+  dolly.updateMatrixWorld(true);
+}
+
+/* real-world walking: move the body by the headset's LOCAL position delta,
+   rotated into world — so leaning/walking carries the body with zero drift */
+let prevLocal = null;
+function followHead(dt) {
+  if (!renderer.xr.isPresenting && !desktop) { prevLocal = null; return; }
+  if (prevLocal) {
+    _d.set(camera.position.x - prevLocal.x, 0, camera.position.z - prevLocal.z);
+    _d.applyQuaternion(dolly.quaternion);
+    playerBody.position.x += _d.x;
+    playerBody.position.z += _d.z;
+  }
+  prevLocal = { x: camera.position.x, z: camera.position.z };
+}
+
 function updateLocomotion(dt) {
   snapCooldown = Math.max(0, snapCooldown - dt);
-
-  /* every held grip pulls the body toward its anchor —
-     world anchors are stiff (climb), air anchors are soft (grip movement) */
-  const locks = hands.filter(h => h.worldLock || h.airLock);
-  let lockVel = null;
-  if (locks.length) {
-    _v.set(0, 0, 0);
-    for (const h of locks) {
-      h.grip.getWorldPosition(_hp);
-      const a = h.worldLock || h.airLock;
-      _d.set(a.x - _hp.x, a.y - _hp.y, a.z - _hp.z);
-      _d.multiplyScalar(h.worldLock ? SPRING : AIR_SPRING);
-      if (_d.length() > LOCK_VCAP) _d.setLength(LOCK_VCAP);
-      _v.add(_d);
-    }
-    _v.divideScalar(locks.length);
-    lockVel = { x: _v.x, y: _v.y, z: _v.z };
-  }
 
   if (renderer.xr.isPresenting) {
     const { mx, my, tx } = readSticks();
@@ -737,24 +882,23 @@ function updateLocomotion(dt) {
     const dead = v => Math.abs(v) > 0.15 ? v : 0;
     const sx = dead(mx), sz = dead(my);
 
-    /* track real-world walking: shift the physics body by headset XZ delta */
-    if (prevHead) {
-      _d.set(camera.position.x - prevHead.x, 0, camera.position.z - prevHead.z);
-      _d.applyQuaternion(dolly.quaternion);
-      playerBody.position.x += _d.x;
-      playerBody.position.z += _d.z;
-    }
-    prevHead = { x: camera.position.x, z: camera.position.z };
-
-    if (lockVel) {
-      playerBody.velocity.set(
-        lockVel.x + sx * CLIMB_STEER,
-        lockVel.y,
-        lockVel.z + sz * CLIMB_STEER
-      );
-    } else {
-      playerBody.velocity.x = sx * WALK_SPEED;
-      playerBody.velocity.z = sz * WALK_SPEED;
+    /* stick movement follows the VIEW (camera world yaw), not the rig origin */
+    camera.getWorldDirection(_fwd);
+    _fwd.y = 0; _fwd.normalize();
+    _right.crossVectors(_fwd, UP).normalize();
+    if (sx || sz) {
+      const airK = grounded ? 1 : AIR_CTRL;
+      const tvx = (_fwd.x * -sz + _right.x * sx) * WALK_SPEED * airK;
+      const tvz = (_fwd.z * -sz + _right.z * sx) * WALK_SPEED * airK;
+      const k = Math.min(1, STICK_RESP * dt);
+      playerBody.velocity.x += (tvx - playerBody.velocity.x) * k;
+      playerBody.velocity.z += (tvz - playerBody.velocity.z) * k;
+    } else if (grounded) {
+      /* no input → mild ground drag only. Never brake hard: momentum from
+         paddle strokes, push-offs and landings must survive. */
+      const drag = Math.max(0, 1 - 3 * dt);
+      playerBody.velocity.x *= drag;
+      playerBody.velocity.z *= drag;
     }
   } else if (desktop) {
     camera.rotation.order = 'YXZ';
@@ -767,13 +911,18 @@ function updateLocomotion(dt) {
     camera.getWorldDirection(_fwd);
     _fwd.y = 0; _fwd.normalize();
     _right.crossVectors(_fwd, UP).normalize();
-    const wx = _fwd.x * -dz + _right.x * dx;
-    const wz = _fwd.z * -dz + _right.z * dx;
-    if (lockVel) {
-      playerBody.velocity.set(lockVel.x + wx * CLIMB_STEER, lockVel.y, lockVel.z + wz * CLIMB_STEER);
-    } else {
-      playerBody.velocity.x = wx * WALK_SPEED;
-      playerBody.velocity.z = wz * WALK_SPEED;
+    if (dx || dz) {
+      const airK = grounded ? 1 : AIR_CTRL;
+      const tvx = (_fwd.x * -dz + _right.x * dx) * WALK_SPEED * airK;
+      const tvz = (_fwd.z * -dz + _right.z * dx) * WALK_SPEED * airK;
+      const k = Math.min(1, STICK_RESP * dt);
+      playerBody.velocity.x += (tvx - playerBody.velocity.x) * k;
+      playerBody.velocity.z += (tvz - playerBody.velocity.z) * k;
+    } else if (grounded) {
+      /* no keys → mild ground drag; keeps paddle / push-off momentum alive */
+      const drag = Math.max(0, 1 - 3 * dt);
+      playerBody.velocity.x *= drag;
+      playerBody.velocity.z *= drag;
     }
   }
 }
@@ -794,18 +943,18 @@ function computeGrounded() {
 function tryJump(force = false) {
   if (jumpCooldown > 0) return;
   if (!force && coyote <= 0) return;
-  if (hands.some(h => h.worldLock)) return;   // busy climbing a surface
+  if (hands.some(h => h.pinned)) return;      // busy gripping a surface
   playerBody.velocity.y = JUMP_V;
   coyote = 0;
   jumpCooldown = 0.45;
   susV += 1.2;                                // legs extend into the jump
 }
 
-/* the jump gesture: both grips holding air, both hands shoved downward */
+/* the jump gesture: both grips in the air, both hands shoved downward */
 function checkDoubleGripJump(dt) {
   dgCooldown = Math.max(0, dgCooldown - dt);
   if (dgCooldown > 0) return;
-  const a = hands.filter(h => h.airLock);
+  const a = hands.filter(h => h.airGrip);
   if (a.length !== 2) return;
   let down = 0;
   for (const h of a) if ((h.gripVy || 0) < -1.1) down++;
@@ -848,39 +997,21 @@ function updateSuspension(dt) {
   if (susC > SUS_MAX) { susC = SUS_MAX; susV = Math.max(susV, 0); }
 }
 
-/* ---------------- held blocks & hand physics ---------------- */
-const _tQuat = new THREE.Quaternion();
-const _cQuat = new CANNON.Quaternion();
-
-function updateHands(dt) {
-  for (const h of hands) {
-    if (!renderer.xr.isPresenting) {
-      /* park hand bodies out of the world when there is no session */
-      h.body.velocity.set(0, 0, 0);
-      h.body.position.set(0, -50, 0);
-      h.gripVy = 0;
-      continue;
+/* which hands were stopped by static geometry (the push-off reaction source) */
+function scanBlocked() {
+  blockedHands.clear();
+  for (const c of world.contacts) {
+    for (const h of hands) {
+      const hb = h.body;
+      if ((c.bi === hb && staticSet.has(c.bj.id)) ||
+          (c.bj === hb && staticSet.has(c.bi.id))) blockedHands.add(hb);
     }
-    h.grip.getWorldPosition(_hp);
-    h.gripVy = dt > 0 ? (_hp.y - (h.prevGripY ?? _hp.y)) / dt : 0;
-    h.prevGripY = _hp.y;
-    /* kinematic hand body follows the controller → can shove blocks */
-    _v.set(_hp.x - h.body.position.x, _hp.y - h.body.position.y, _hp.z - h.body.position.z);
-    const spd = Math.min(_v.length() / Math.max(dt, 0.001), 15);
-    _v.setLength(spd);
-    h.body.velocity.set(_v.x, _v.y, _v.z);
-    h.body.position.set(_hp.x, _hp.y, _hp.z);
-    /* held block follows the palm */
-    if (h.heldBlock) follow(h.heldBlock, _hp, _hq, dt);
-  }
-  if (mouseGrab) {
-    camera.getWorldDirection(_fwd);
-    camera.getWorldPosition(_p);
-    _hp.copy(_p).addScaledVector(_fwd, 0.75);
-    camera.getWorldQuaternion(_tQuat);
-    follow(mouseGrab, _hp, _tQuat, dt);
   }
 }
+
+/* ---------------- held blocks & hand servo physics ---------------- */
+const _tQuat = new THREE.Quaternion();
+const _cQuat = new CANNON.Quaternion();
 
 function follow(rec, tPos, tQuat, dt) {
   const b = rec.body;
@@ -897,7 +1028,289 @@ function follow(rec, tPos, tQuat, dt) {
   b.position.set(tPos.x, tPos.y, tPos.z);
 }
 
-/* ---------------- hover highlight ---------------- */
+/* hands: velocity-servo toward the controller pose.
+   pinned  → hand welded to the anchor; body velocity is driven straight at the
+             grip point (climb / hang / pull — authoritative over gravity)
+   blocked → servo force stalls on a wall; its reaction shoves the body (push-off)
+   airGrip → paddle thrust opposite the hand's motion relative to the body (move) */
+function updateHands(dt) {
+  const presenting = renderer.xr.isPresenting;
+  let pinCount = 0;
+  _pv.set(0, 0, 0);
+  for (let i = 0; i < 2; i++) {
+    const h = hands[i];
+    if (!presenting && !h.pinned && !h.testTarget) {
+      h.body.velocity.set(0, 0, 0);
+      h.body.position.set(0, -50, 0);
+      h.gripVy = 0;
+      continue;
+    }
+    let t;
+    if (h.testTarget) t = _hp.copy(h.testTarget);
+    else if (presenting) { h.grip.getWorldPosition(_hp); t = _hp; }
+    else t = _hp.set(playerBody.position.x, playerBody.position.y, playerBody.position.z);
+    h.gripVy = dt > 0 ? (t.y - (h.prevGripY ?? t.y)) / dt : 0;
+    h.prevGripY = t.y;
+
+    if (h.pinned) {
+      /* weld the hand at the anchor; accumulate the pull on the body */
+      h.body.type = CANNON.Body.KINEMATIC;
+      h.body.velocity.set(0, 0, 0);
+      h.body.position.set(h.anchor.x, h.anchor.y, h.anchor.z);
+      _d.set(h.anchor.x - t.x, h.anchor.y - t.y, h.anchor.z - t.z);
+      _d.multiplyScalar(SPRING);
+      if (_d.length() > LOCK_VCAP) _d.setLength(LOCK_VCAP);
+      _pv.add(_d);
+      pinCount++;
+      continue;
+    }
+
+    h.body.type = CANNON.Body.DYNAMIC;
+    /* servo velocity toward the controller */
+    _d.set(t.x - h.body.position.x, t.y - h.body.position.y, t.z - h.body.position.z);
+    const reach = Math.min(_d.length() * FOLLOW_H, SERVO_VMAX);
+    _v.set(h.body.velocity.x, h.body.velocity.y, h.body.velocity.z);  // post-step
+    if (_d.lengthSq() > 1e-8) _d.normalize().multiplyScalar(reach);
+    else _d.set(0, 0, 0);
+    h.body.velocity.set(_d.x, _d.y, _d.z);
+    /* blocked by a wall → the servo stall reaction shoves the body away */
+    if (blockedHands.has(h.body)) {
+      _d.set(_d.x - _v.x, _d.y - _v.y, _d.z - _v.z);   // vServo - vHand
+      const dl = _d.length();
+      if (dl > 0.05) {
+        const F = Math.min(dl * HAND_MASS / Math.max(dt, 1e-3), PUSH_F_MAX);
+        if (F > 10) {
+          _d.normalize().multiplyScalar(-(F / PLAYER_MASS) * dt);
+          playerBody.velocity.x += _d.x;
+          playerBody.velocity.y += _d.y;
+          playerBody.velocity.z += _d.z;
+        }
+      }
+    }
+    /* gripping the air → paddle: thrust opposite the hand's relative motion */
+    if (h.airGrip) {
+      _d.set(
+        h.body.velocity.x - playerBody.velocity.x,
+        h.body.velocity.y - playerBody.velocity.y,
+        h.body.velocity.z - playerBody.velocity.z
+      );
+      const sp = _d.length();
+      if (sp > 0.05) {
+        const a = Math.min(sp * AIR_GAIN, AIR_MAX);
+        _d.normalize().multiplyScalar(-a * dt);
+        playerBody.velocity.x += _d.x;
+        playerBody.velocity.y += _d.y;
+        playerBody.velocity.z += _d.z;
+      }
+    }
+    if (h.heldBlock) follow(h.heldBlock, t, _hq, dt);
+  }
+  if (pinCount) {
+    _pv.divideScalar(pinCount);
+    const { sx, sz } = deadStick();
+    playerBody.velocity.set(_pv.x + sx * CLIMB_STEER, _pv.y, _pv.z + sz * CLIMB_STEER);
+  }
+  if (mouseGrab) {
+    camera.getWorldDirection(_fwd);
+    camera.getWorldPosition(_p);
+    _hp.copy(_p).addScaledVector(_fwd, 0.75);
+    camera.getWorldQuaternion(_tQuat);
+    follow(mouseGrab, _hp, _tQuat, dt);
+  }
+}
+/* ==== PART4 ==== */
+
+/* ---------------- spawnable props: block · crate · ball · buddy ---------------- */
+const props = [];      // crates & balls (pushable)
+const dummies = [];    // little guys that get pushed over and stand back up
+
+function spawnCrate(x, y, z) {
+  const mesh = new THREE.Mesh(
+    new THREE.BoxGeometry(0.4, 0.4, 0.4),
+    new THREE.MeshStandardMaterial({ color: WOOD, roughness: 0.85 })
+  );
+  mesh.castShadow = mesh.receiveShadow = true;
+  scene.add(mesh);
+  const body = new CANNON.Body({
+    mass: 4,
+    collisionFilterGroup: G_BLOCK, collisionFilterMask: -1,
+    shape: new CANNON.Box(new CANNON.Vec3(0.2, 0.2, 0.2)),
+    position: new CANNON.Vec3(x, y, z),
+    linearDamping: 0.05, angularDamping: 0.2
+  });
+  world.addBody(body);
+  props.push({ mesh, body, kind: 'crate' });
+}
+
+function spawnBallProp(x, y, z) {
+  const mesh = new THREE.Mesh(
+    new THREE.SphereGeometry(0.18, 18, 14),
+    new THREE.MeshStandardMaterial({ color: 0xe2574c, roughness: 0.4 })
+  );
+  mesh.castShadow = true;
+  scene.add(mesh);
+  const body = new CANNON.Body({
+    mass: 1,
+    collisionFilterGroup: G_BLOCK, collisionFilterMask: -1,
+    shape: new CANNON.Sphere(0.18),
+    position: new CANNON.Vec3(x, y, z),
+    linearDamping: 0.02, angularDamping: 0.1
+  });
+  world.addBody(body);
+  props.push({ mesh, body, kind: 'ball' });
+}
+
+function spawnDummy(x, y, z) {
+  const mesh = new THREE.Group();
+  const torso = new THREE.Mesh(new THREE.BoxGeometry(0.3, 0.44, 0.18),
+    new THREE.MeshStandardMaterial({ color: 0xe8833a, roughness: 0.7 }));
+  torso.position.y = 0.58; torso.castShadow = true;
+  const legs = new THREE.Mesh(new THREE.BoxGeometry(0.26, 0.36, 0.16),
+    new THREE.MeshStandardMaterial({ color: 0x46586e, roughness: 0.8 }));
+  legs.position.y = 0.18; legs.castShadow = true;
+  const head = new THREE.Mesh(new THREE.SphereGeometry(0.11, 14, 10),
+    new THREE.MeshStandardMaterial({ color: 0xe8b98a, roughness: 0.6 }));
+  head.position.y = 0.9; head.castShadow = true;
+  mesh.add(torso, legs, head);
+  scene.add(mesh);
+  const body = new CANNON.Body({
+    mass: 8,
+    material: dummyMat,
+    collisionFilterGroup: G_DUMMY, collisionFilterMask: -1,
+    linearDamping: 0.15, angularDamping: 0.6
+  });
+  body.addShape(new CANNON.Box(new CANNON.Vec3(0.13, 0.18, 0.08)), new CANNON.Vec3(0, 0.18, 0));
+  body.addShape(new CANNON.Box(new CANNON.Vec3(0.15, 0.22, 0.09)), new CANNON.Vec3(0, 0.58, 0));
+  body.addShape(new CANNON.Sphere(0.11), new CANNON.Vec3(0, 0.9, 0));
+  body.position.set(x, y, z);
+  world.addBody(body);
+  dummies.push({ mesh, body, downT: 0 });
+}
+
+function spawnItem(idx, pos) {
+  const x = pos?.x ?? 0, z = pos?.z ?? 1.2;
+  const y = pos?.y ?? 0.4;
+  if (idx === 0) {
+    const rec = addBlock(x, Math.max(y, BALL_R), z, nextColor());
+    rec.body.wakeUp();
+    if (blocks.length > 24) {           // keep the block pool bounded
+      const old = blocks.shift();
+      scene.remove(old.mesh);
+      world.removeBody(old.body);
+    }
+  } else if (idx === 1) spawnCrate(x, Math.max(y, 0.3), z);
+  else if (idx === 2) spawnBallProp(x, Math.max(y, 0.25), z);
+  else if (idx === 3) spawnDummy(x, Math.max(y, 0.02), z);
+  if (props.length > 10) {              // cap pushable props
+    const old = props.shift();
+    scene.remove(old.mesh);
+    world.removeBody(old.body);
+  }
+  if (dummies.length > 6) {
+    const old = dummies.shift();
+    scene.remove(old.mesh);
+    world.removeBody(old.body);
+  }
+}
+
+/* buddy self-righting: knocked over → gets back up after a beat */
+const _up = new CANNON.Vec3(), _fwdC = new CANNON.Vec3(), _tqC = new CANNON.Quaternion();
+const _axisC = new CANNON.Vec3();   // dedicated axis (never alias _up)
+function updateProps(dt) {
+  for (const p of props) {
+    if (p.body.position.y < -10) {
+      p.body.position.set(0, 1, 2.4);
+      p.body.velocity.set(0, 0, 0);
+    }
+    p.mesh.position.copy(p.body.position);
+    p.mesh.quaternion.copy(p.body.quaternion);
+  }
+  for (const d of dummies) {
+    if (d.body.position.y < -10) {
+      d.body.position.set(0, 0.02, 2.4);
+      d.body.velocity.set(0, 0, 0);
+      d.body.quaternion.set(0, 0, 0, 1);
+    }
+    d.body.quaternion.vmult(_up.set(0, 1, 0), _up);
+    if (d.rising) {
+      /* knocked over → gets back up, keeping the facing. While righting the
+         body goes kinematic — with mass zeroed too, otherwise the solver (via
+         the leftover invMass) keeps shoving it and overpowers the slerp. */
+      d.body.type = CANNON.Body.KINEMATIC;
+      d.body.mass = 0;
+      d.body.updateMassProperties();
+      d.body.velocity.set(0, 0, 0);
+      d.body.angularVelocity.set(0, 0, 0);
+      d.body.position.y += dt * 1.2;
+      d.body.quaternion.vmult(_fwdC.set(0, 0, 1), _fwdC);
+      const yaw = Math.atan2(_fwdC.x, _fwdC.z);
+      _tqC.setFromAxisAngle(_axisC.set(0, 1, 0), yaw);
+      d.body.quaternion.slerp(_tqC, Math.min(1, 8 * dt), d.body.quaternion);
+      if (_up.y > 0.98) {
+        d.upT = (d.upT || 0) + dt;
+        if (d.upT > 0.15) {
+          d.rising = false; d.upT = 0;
+          d.body.type = CANNON.Body.DYNAMIC;
+          d.body.mass = 8;
+          d.body.updateMassProperties();
+          d.body.position.y = Math.max(d.body.position.y, 0.02);
+          d.body.velocity.set(0, 0, 0);
+          d.body.wakeUp();
+        }
+      } else d.upT = 0;
+    } else {
+      if (_up.y < 0.7) d.downT += dt;
+      else d.downT = Math.max(0, d.downT - dt);   // decay, not hard reset
+      if (d.downT > 0.3) d.rising = true;
+    }
+    d.mesh.position.copy(d.body.position);
+    d.mesh.quaternion.copy(d.body.quaternion);
+  }
+}
+
+/* ---------------- hover highlight + wrist menu cursor ---------------- */
+const menuRay = new THREE.Raycaster();
+function updateMenu() {
+  if (!renderer.xr.isPresenting) {
+    menuHover = -1;
+    if (lastMenuHover !== menuHover) { drawMenu(menuHover); menuTex.needsUpdate = true; lastMenuHover = menuHover; }
+    menuCursor.visible = false;
+    return;
+  }
+  hands[1].ctrl.getWorldPosition(_hp);
+  hands[1].ctrl.getWorldQuaternion(_tQuat);
+  _fwd.set(0, 0, -1).applyQuaternion(_tQuat);
+  menuRay.set(_hp, _fwd);
+  menuRay.far = 1.0;
+  const hit = menuRay.intersectObject(menuPanel, false)[0];
+  if (hit && hit.uv) {
+    menuHover = (hit.uv.x < 0.5 ? 0 : 1) + (hit.uv.y > 0.5 ? 0 : 2);
+    menuCursor.position.set((hit.uv.x - 0.5) * MENU_W, (hit.uv.y - 0.5) * MENU_H, 0.003);
+    menuCursor.visible = true;
+  } else {
+    menuHover = -1;
+    menuCursor.visible = false;
+  }
+  if (menuHover !== lastMenuHover) {
+    drawMenu(menuHover);
+    menuTex.needsUpdate = true;
+    lastMenuHover = menuHover;
+  }
+}
+function spawnFromMenu() {
+  if (menuHover < 0) return;
+  hands[1].ctrl.getWorldPosition(_hp);
+  hands[1].ctrl.getWorldQuaternion(_tQuat);
+  _fwd.set(0, 0, -1).applyQuaternion(_tQuat);
+  menuRay.set(_hp, _fwd);
+  menuRay.far = 3.0;
+  const hit = menuRay.intersectObject(ground, false)[0];
+  const pos = hit ? { x: hit.point.x, y: hit.point.y + 0.4, z: hit.point.z }
+                  : { x: _hp.x + _fwd.x * 0.8, y: Math.max(0.4, _hp.y + _fwd.y * 0.8), z: _hp.z + _fwd.z * 0.8 };
+  spawnItem(menuHover, pos);
+  buzz(hands[1], 50, 0.7);
+}
+
 function updateHover() {
   for (const h of hands) {
     let hot = null;
@@ -930,6 +1343,7 @@ function tick(dt) {
   updateLocomotion(dt);
   updateHands(dt);
   world.step(1 / 60, dt, 4);
+  scanBlocked();
   updateSuspension(dt);
 
   /* sync visuals + respawn guards */
@@ -943,6 +1357,7 @@ function tick(dt) {
     b.mesh.position.copy(b.body.position);
     b.mesh.quaternion.copy(b.body.quaternion);
   }
+  updateProps(dt);
   if (playerBody.position.y < -10) {
     playerBody.position.set(0, BALL_R, 2.4);
     playerBody.velocity.set(0, 0, 0);
@@ -951,12 +1366,10 @@ function tick(dt) {
   /* gray suspension ball follows the physics body */
   ballMesh.position.set(playerBody.position.x, playerBody.position.y, playerBody.position.z);
 
-  /* camera = ball + suspension + real headset offset (dips on push/landing) */
-  dolly.position.set(
-    playerBody.position.x - camera.position.x,
-    playerBody.position.y - BALL_R - susC,
-    playerBody.position.z - camera.position.z
-  );
+  /* camera rig: ball + suspension + rotated head offset */
+  syncDolly();
+  followHead(dt);     // body stays under the head (real walking / snap recovery)
+  syncDolly();
 
   /* grass + sky follow the player */
   grassUniforms.uTime.value += dt;
@@ -977,6 +1390,7 @@ function tick(dt) {
   sun.position.set(playerBody.position.x + 26, 44, playerBody.position.z + 14);
   sun.target.position.set(playerBody.position.x, 0, playerBody.position.z);
 
+  updateMenu();
   updateHover();
 }
 renderer.setAnimationLoop(() => {
@@ -993,20 +1407,33 @@ addEventListener('resize', () => {
 
 /* debug hook for headless tests (harmless in normal use) */
 window.__BR = {
-  playerBody, blocks, hands, world, CANNON, TABLE_TOP_Y, BALL_R,
+  playerBody, blocks, hands, world, CANNON, TABLE_TOP_Y, BALL_R, PLAYER_MASS,
   gripDown, gripUp, grabBlock, releaseBlock, tryJump, handleJump, tick, keys,
-  ballMesh, grassTiles, grassUniforms, skyDome, sunSprite,
+  ballMesh, grassTiles, grassUniforms, skyDome, sunSprite, menuPanel,
+  snapTurn, syncDolly, followHead, spawnItem, props, dummies, blockedHands,
+  updateLocomotion,
+  get presenting() { return renderer.xr.isPresenting; },
+  cameraLean(dx, dz) {                      // test hook: simulate a head offset
+    camera.position.x += dx; camera.position.z += dz;
+    syncDolly(); dolly.updateMatrixWorld(true);
+  },
+  headXZ() {                                // test hook: head world XZ
+    camera.getWorldPosition(_hp);
+    return { x: _hp.x, z: _hp.z };
+  },
   get desktop() { return desktop; },
   get grounded() { return grounded; },
   get susC() { return susC; },
-  get camY() { return dolly.position.y + camera.position.y; }
+  get camY() { return dolly.position.y + camera.position.y; },
+  get yaw() { return yaw; }, set yaw(v) { yaw = v; },
+  get menuHover() { return menuHover; }
 };
 
 /* boot text */
 if (navigator.xr) {
   navigator.xr.isSessionSupported('immersive-vr').then(ok => {
     status.textContent = ok
-      ? 'Headset detected — grip the air to move, both grips + push down to jump.'
+      ? 'Headset detected — grip the air and stroke to move, both grips + push down to jump.'
       : 'No VR headset found — ENTER VR starts desktop mode instead.';
   }).catch(() => { status.textContent = 'WebXR check failed — desktop mode available.'; });
 } else {
